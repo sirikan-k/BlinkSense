@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="th">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ISTEM 2026: Drowsiness Detection</title>
+
+    <!-- โหลด Library ของ MediaPipe และ ONNX Runtime Web -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1e1e1e;
+            color: white;
+            text-align: center;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 15px;
+        }
+
+        /* ซ่อนวิดีโอต้นฉบับ โชว์แค่ Canvas ที่วาดกราฟิกทับแล้ว */
+        video {
+            display: none;
+        }
+
+        canvas#output_canvas {
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+            max-width: 100%;
+            background-color: #000;
+        }
+
+        #status {
+            font-size: 28px;
+            font-weight: bold;
+            padding: 15px 30px;
+            border-radius: 10px;
+            background-color: #333;
+            transition: 0.3s;
+        }
+
+        .stats {
+            display: flex;
+            gap: 12px;
+        }
+
+        .stat-box {
+            background: #2a2a2a;
+            border-radius: 10px;
+            padding: 10px 18px;
+            min-width: 84px;
+        }
+
+        .stat-box .v {
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        .stat-box .l {
+            font-size: 11px;
+            color: #999;
+            margin-top: 2px;
+        }
+
+        .awake {
+            color: #00ff88;
+            text-shadow: 0 0 10px #00ff88;
+        }
+
+        .sleepy {
+            color: #ff3333;
+            text-shadow: 0 0 10px #ff3333;
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            50% {
+                opacity: 0.5;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <h1>👁️ BlinkSense </h1>
+
+        <!-- ส่วนแสดงผลกล้อง -->
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas" width="640" height="480"></canvas>
+
+        <!-- Canvas ลับสำหรับครอปรูปตา (64x64) ส่งให้ AI -->
+        <canvas id="eye_crop_canvas" width="64" height="64" style="display: none;"></canvas>
+
+        <!-- ป้ายแจ้งสถานะ -->
+        <div id="status">กำลังโหลดโมเดล... ⏳</div>
+
+        <!-- สถิติเชิงเวลา: เอาไว้อธิบายกรรมการว่าเราไม่ได้ตัดสินจากเฟรมเดียว -->
+        <div class="stats">
+            <div class="stat-box">
+                <div class="v" id="perclosStat">0%</div>
+                <div class="l">PERCLOS (30s)</div>
+            </div>
+            <div class="stat-box">
+                <div class="v" id="eventStat">0</div>
+                <div class="l">Sleepy Events</div>
+            </div>
+            <div class="stat-box">
+                <div class="v" id="durStat">0.0s</div>
+                <div class="l">หลับตาต่อเนื่อง</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const eyeCropCanvas = document.getElementById('eye_crop_canvas');
+        const eyeCropCtx = eyeCropCanvas.getContext('2d');
+        const statusElement = document.getElementById('status');
+        const perclosStat = document.getElementById('perclosStat');
+        const eventStat = document.getElementById('eventStat');
+        const durStat = document.getElementById('durStat');
+
+        // ---------- แก้ปัญหาสำคัญสำหรับ iPhone Safari ----------
+        // onnxruntime-web โดย default จะพยายามใช้ multi-threaded WASM
+        // ซึ่งต้องมี HTTP header พิเศษ (Cross-Origin-Opener-Policy /
+        // Cross-Origin-Embedder-Policy) ที่ static hosting ทั่วไป (เช่น
+        // GitHub Pages) ไม่ได้ตั้งให้ ผลคือบน iOS Safari โมเดลจะโหลดไม่ผ่าน
+        // หรือค้างเงียบๆ โดยไม่มี error ชัดเจน — บังคับ single-thread กัน
+        // ปัญหานี้ (ช้าลงเล็กน้อยแต่ทำงานได้แน่นอนทุกอุปกรณ์)
+        ort.env.wasm.numThreads = 1;
+        ort.env.wasm.simd = true;
+        ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+
+        let onnxSession = null;
+
+        // ---------- ระบบวิเคราะห์เชิงเวลา (Temporal Analysis) ----------
+        // ตัดสิน "ง่วงจริง" จาก 2 เงื่อนไข แทนที่จะเชื่อเฟรมเดียว:
+        //   1) PERCLOS: สัดส่วนเวลาที่ตาปิดใน 30 วินาทีล่าสุด > 15%
+        //      (ตัวชี้วัดมาตรฐานจากงานวิจัยความปลอดภัยการขับขี่, FHWA 1994)
+        //   2) Microsleep: ตาปิดต่อเนื่อง >= 0.5 วินาที ให้เตือนทันที
+        const PERCLOS_WINDOW_MS = 30000;
+        const PERCLOS_THRESHOLD = 0.15;
+        const MICROSLEEP_SEC = 0.5;
+
+        let closureLog = [];      // { t, closed }
+        let closedSince = null;
+        let sleepyEvents = 0;
+        let wasAlerting = false;
+
+        let audioCtx = null;
+        function beep(freq, dur) {
+            try {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.frequency.value = freq;
+                osc.type = 'sine';
+                gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+                osc.connect(gain).connect(audioCtx.destination);
+                osc.start();
+                osc.stop(audioCtx.currentTime + dur);
+            } catch (e) { }
+        }
+        let lastBeep = 0;
+
+        // 1. โหลดโมเดล ONNX
+        async function loadModel() {
+            try {
+                // ต้องแน่ใจว่าไฟล์ eye_model_2classes.onnx อยู่โฟลเดอร์เดียวกับ index.html
+                onnxSession = await ort.InferenceSession.create('./eye_model_2classes.onnx');
+                statusElement.innerText = "พร้อมใช้งาน! รอตรวจจับใบหน้า 👀";
+                console.log("ONNX Model Loaded!");
+            } catch (e) {
+                console.error(e);
+                statusElement.innerText = "❌ โหลดโมเดลไม่สำเร็จ เช็คไฟล์ ONNX";
+            }
+        }
+
+        // 2. ฟังก์ชันเตรียมข้อมูลรูปภาพให้เหมือนตอนเทรน PyTorch (64x64, Normalization)
+        function preprocessImage(canvasData) {
+            const width = 64;
+            const height = 64;
+            const floatData = new Float32Array(3 * width * height);
+
+            // วนลูปแยกสี RGB และทำ Normalization ((x/255) - 0.5) / 0.5
+            for (let i = 0; i < width * height; i++) {
+                let r = canvasData.data[i * 4 + 0] / 255.0;
+                let g = canvasData.data[i * 4 + 1] / 255.0;
+                let b = canvasData.data[i * 4 + 2] / 255.0;
+
+                floatData[i] = (r - 0.5) / 0.5;                               // Red
+                floatData[width * height + i] = (g - 0.5) / 0.5;              // Green
+                floatData[2 * width * height + i] = (b - 0.5) / 0.5;          // Blue
+            }
+            // สร้าง Tensor [1, 3, 64, 64] สำหรับโมเดล
+            return new ort.Tensor('float32', floatData, [1, 3, width, height]);
+        }
+
+        // 3. ฟังก์ชันประมวลผลเมื่อ MediaPipe เจอใบหน้า
+        async function onResults(results) {
+            const now = performance.now();
+
+            // วาดวิดีโอลง Canvas แบบ mirror (ให้ดูเป็นธรรมชาติเหมือนกระจก
+            // ตอน demo สด — ค่า landmark ที่ MediaPipe คืนมาอิงกับภาพต้นฉบับ
+            // ที่ยังไม่ mirror ดังนั้น flip ทั้ง context แล้ววาดทุกอย่างทับ
+            // ไปพร้อมกัน พิกัดจะสอดคล้องกันเองโดยไม่ต้องคำนวณกลับ)
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.translate(canvasElement.width, 0);
+            canvasCtx.scale(-1, 1);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0 && onnxSession) {
+                const landmarks = results.multiFaceLandmarks[0];
+
+                // หาจุดรอบดวงตา (ซ้าย-ขวา) เพื่อตีกรอบ Bounding Box
+                // จุดอ้างอิง MediaPipe: 33 (ขอบตาซ้ายสุด), 263 (ขอบตาขวาสุด), 159/386 (ขอบบน), 145/374 (ขอบล่าง)
+                let minX = Math.min(landmarks[33].x, landmarks[159].x, landmarks[145].x);
+                let maxX = Math.max(landmarks[263].x, landmarks[386].x, landmarks[374].x);
+                let minY = Math.min(landmarks[159].y, landmarks[386].y);
+                let maxY = Math.max(landmarks[145].y, landmarks[374].y);
+
+                // เผื่อระยะขอบ (Padding) ให้เห็นตาชัดขึ้น
+                let padX = (maxX - minX) * 0.2;
+                let padY = (maxY - minY) * 1.0;
+
+                let boxX = Math.max(0, (minX - padX) * canvasElement.width);
+                let boxY = Math.max(0, (minY - padY) * canvasElement.height);
+                let boxW = Math.min(canvasElement.width - boxX, (maxX - minX + 2 * padX) * canvasElement.width);
+                let boxH = Math.min(canvasElement.height - boxY, (maxY - minY + 2 * padY) * canvasElement.height);
+
+                // วาดกรอบสี่เหลี่ยมรอบดวงตาบนหน้าจอ
+                canvasCtx.strokeStyle = "#00ff88";
+                canvasCtx.lineWidth = 2;
+                canvasCtx.strokeRect(boxX, boxY, boxW, boxH);
+
+                // ดึงภาพเฉพาะส่วนตาไปใส่ใน Canvas ลับ (ย่อเป็น 64x64)
+                eyeCropCtx.drawImage(canvasElement, boxX, boxY, boxW, boxH, 0, 0, 64, 64);
+                let imgData = eyeCropCtx.getImageData(0, 0, 64, 64);
+
+                // ทำนายผลด้วย ONNX Model
+                const tensor = preprocessImage(imgData);
+                const feeds = { input: tensor }; // 'input' คือชื่อ layer แรกของโมเดลเรา
+                const outputData = await onnxSession.run(feeds);
+
+                // แปลผลลัพธ์ (คลาส 0 = awake, คลาส 1 = sleepy)
+                const scores = outputData.output.data;
+                const awakeScore = scores[0];
+                const sleepyScore = scores[1];
+                const frameClosed = sleepyScore > awakeScore;
+
+                // ---------- อัปเดต Microsleep (ตาปิดต่อเนื่อง) ----------
+                if (frameClosed) {
+                    if (closedSince === null) closedSince = now;
+                } else {
+                    closedSince = null;
+                }
+                const closedDur = closedSince !== null ? (now - closedSince) / 1000 : 0;
+                durStat.innerText = closedDur.toFixed(1) + 's';
+
+                // ---------- อัปเดต PERCLOS (สัดส่วนตาปิดใน 30 วิล่าสุด) ----------
+                closureLog.push({ t: now, closed: frameClosed });
+                while (closureLog.length && now - closureLog[0].t > PERCLOS_WINDOW_MS) closureLog.shift();
+                const closedFrames = closureLog.filter(x => x.closed).length;
+                const perclos = closureLog.length ? closedFrames / closureLog.length : 0;
+                perclosStat.innerText = Math.round(perclos * 100) + '%';
+
+                // ---------- ตัดสิน "ง่วงจริง" จาก 2 เงื่อนไข ไม่ใช่เฟรมเดียว ----------
+                const isDrowsy = (closedDur >= MICROSLEEP_SEC) || (perclos > PERCLOS_THRESHOLD);
+
+                if (isDrowsy && !wasAlerting) {
+                    sleepyEvents++;
+                    eventStat.innerText = sleepyEvents;
+                }
+                wasAlerting = isDrowsy;
+
+                if (isDrowsy) {
+                    const reason = closedDur >= MICROSLEEP_SEC
+                        ? `😴 MICROSLEEP — หลับตาต่อเนื่อง ${closedDur.toFixed(1)}s`
+                        : `😴 DROWSY — PERCLOS ${Math.round(perclos * 100)}% เกินเกณฑ์ 15%`;
+                    statusElement.innerText = reason;
+                    statusElement.className = "sleepy";
+                    canvasCtx.strokeStyle = "#ff3333";
+                    canvasCtx.strokeRect(boxX, boxY, boxW, boxH);
+                    if (now - lastBeep > 1800) {
+                        beep(closedDur >= MICROSLEEP_SEC ? 660 : 990, 0.25);
+                        lastBeep = now;
+                    }
+                } else {
+                    statusElement.innerText = "👀 ลืมตา / ปกติ (Awake)";
+                    statusElement.className = "awake";
+                }
+            } else {
+                // ไม่พบใบหน้าในเฟรมนี้ — อย่าปล่อยให้สถานะเก่าค้างอยู่
+                statusElement.innerText = "🔍 ไม่พบใบหน้า — หันหน้าเข้ากล้อง";
+                statusElement.className = "";
+                closedSince = null;
+            }
+            canvasCtx.restore();
+        }
+
+        // 4. ตั้งค่า Face Mesh และ กล้อง
+        const faceMesh = new FaceMesh({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+            }
+        });
+
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        faceMesh.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await faceMesh.send({ image: videoElement });
+            },
+            width: 640,
+            height: 480
+        });
+
+        // เริ่มต้นการทำงาน
+        loadModel().then(() => camera.start());
+
+    </script>
+</body>
+
+</html>
