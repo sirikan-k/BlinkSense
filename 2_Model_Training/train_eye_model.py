@@ -197,8 +197,7 @@ torch.onnx.export(
     do_constant_folding=True, 
     input_names=['input'], 
     output_names=['output'], 
-    dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
-    use_external_data_format=False  # <--- เพิ่มบรรทัดนี้เพื่อไม่ให้สร้างไฟล์ .data
+    dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
 )
 
 print(f"✅ บันทึกโมเดล ONNX ไฟล์เดียวสำเร็จ!")
