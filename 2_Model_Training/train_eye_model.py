@@ -170,16 +170,58 @@ print("✅ บันทึก checkpoint ไว้ที่ eye_model_best.pth (
 # ==========================================
 try:
     from sklearn.metrics import confusion_matrix, classification_report
+    import matplotlib
+    matplotlib.use("Agg")  # ไม่ต้องเปิดหน้าต่างแสดงผล แค่บันทึกเป็นไฟล์ภาพ
+    import matplotlib.pyplot as plt
+    import numpy as np
+
     _, _, y_true, y_pred = evaluate(model, val_loader)
+    class_names = train_dataset.classes  # เช่น ['awake', 'sleepy']
     cm = confusion_matrix(y_true, y_pred)
+
     print("\n📊 Confusion Matrix (แถว=จริง, คอลัมน์=ทาย) "
-          f"ลำดับคลาส {train_dataset.classes}:")
+          f"ลำดับคลาส {class_names}:")
     print(cm)
     print("\n📊 Classification Report:")
-    print(classification_report(y_true, y_pred, target_names=train_dataset.classes))
-except ImportError:
-    print("\n(ติดตั้ง scikit-learn เพื่อดู confusion matrix: "
-          "pip install scikit-learn --break-system-packages)")
+    print(classification_report(y_true, y_pred, target_names=class_names))
+
+    # ---------- วาดเป็นภาพ PNG พร้อมใช้ในรายงาน (ภาพที่ 5) ----------
+    NAVY = "#16324A"
+    TEAL = "#1F8A83"
+
+    fig, ax = plt.subplots(figsize=(5.2, 4.6), dpi=220)
+    im = ax.imshow(cm, cmap="Blues")
+
+    # ตัวเลขในแต่ละช่อง (สีขาวถ้าพื้นเข้ม, สีเข้มถ้าพื้นอ่อน อ่านง่ายทั้งคู่)
+    thresh = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, f"{cm[i, j]:,}", ha="center", va="center",
+                     fontsize=15, fontweight="bold",
+                     color="white" if cm[i, j] > thresh else NAVY)
+
+    ax.set_xticks(range(len(class_names)))
+    ax.set_yticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, fontsize=11)
+    ax.set_yticklabels(class_names, fontsize=11)
+    ax.set_xlabel("ผลที่โมเดลทาย (Predicted)", fontsize=11, labelpad=8)
+    ax.set_ylabel("คลาสจริง (True Label)", fontsize=11, labelpad=8)
+    ax.set_title(f"Confusion Matrix (Val Accuracy = {best_val_acc*100:.2f}%)",
+                 fontsize=12.5, fontweight="bold", color=NAVY, pad=12)
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(length=0)
+
+    plt.tight_layout()
+    plt.savefig("confusion_matrix.png", dpi=220, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print("✅ บันทึกภาพ Confusion Matrix ไว้ที่ confusion_matrix.png "
+          "(เอาไปใส่แทนภาพที่ 5 ในรายงานได้เลย)")
+
+except ImportError as e:
+    print(f"\n(ยังขาดไลบรารี: {e}. ติดตั้งด้วย: "
+          "pip install scikit-learn matplotlib)")
 
 # ==========================================
 # 5. แปลงและส่งออกโมเดลเป็น ONNX สำหรับใช้งานบนมือถือ
@@ -198,6 +240,26 @@ torch.onnx.export(
     input_names=['input'], 
     output_names=['output'], 
     dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+    # หมายเหตุ: เอา use_external_data_format ออกแล้ว เพราะ PyTorch เวอร์ชันใหม่
+    # ลบพารามิเตอร์นี้ทิ้งไปแล้ว (เรียกจะ error ทันที) ไม่ต้องกังวลเรื่องไฟล์
+    # แยก .onnx.data เพราะขั้นตอนถัดไปข้างล่างจะบังคับรวมเป็นไฟล์เดียวให้เองอยู่แล้ว
 )
 
-print(f"✅ บันทึกโมเดล ONNX ไฟล์เดียวสำเร็จ!")
+# ==========================================
+# 5.1 กันเหนียว: บังคับรวมเป็นไฟล์เดียวอีกรอบ
+# ==========================================
+# PyTorch บางเวอร์ชันจะเมิน use_external_data_format=False และแยกน้ำหนัก
+# โมเดลไปเป็นไฟล์ .onnx.data อยู่ดี ซึ่งเบราว์เซอร์ (onnxruntime-web) โหลด
+# ไม่ได้ ขั้นตอนนี้จึงโหลดโมเดลกลับมาพร้อมข้อมูลภายนอก (ถ้ามี) แล้วบันทึก
+# ทับเป็นไฟล์เดียวแบบสมบูรณ์อีกครั้ง เพื่อการันตีว่าไฟล์ที่ได้ใช้กับเว็บได้แน่นอน
+import onnx as _onnx
+_model = _onnx.load(onnx_path, load_external_data=True)
+_onnx.save_model(_model, onnx_path, save_as_external_data=False)
+
+# ลบไฟล์ .onnx.data เก่าทิ้งถ้ามันถูกสร้างขึ้นมา (ไม่ต้องใช้แล้ว)
+stray_data_file = onnx_path + ".data"
+if os.path.exists(stray_data_file):
+    os.remove(stray_data_file)
+    print(f"🧹 ลบไฟล์ {stray_data_file} ที่ไม่จำเป็นแล้วออก")
+
+print(f"✅ บันทึกโมเดล ONNX ไฟล์เดียวสำเร็จ! ({onnx_path})")
