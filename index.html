@@ -152,7 +152,9 @@
         //   1) PERCLOS: สัดส่วนเวลาที่ตาปิดใน 30 วินาทีล่าสุด > 15%
         //      (ตัวชี้วัดมาตรฐานจากงานวิจัยความปลอดภัยการขับขี่, FHWA 1994)
         //   2) Microsleep: ตาปิดต่อเนื่อง >= 0.5 วินาที ให้เตือนทันที
-        const PERCLOS_WINDOW_MS = 30000;
+        const PERCLOS_WINDOW_MS = 12000; // ลดจาก 30s เหลือ 12s ให้เหมาะกับการ demo สด
+        // (หลักการ PERCLOS ยังถูกต้อง แค่หน้าต่างสั้นลง
+        // เพื่อให้ค่าตอบสนองไวขึ้น ไม่ค้างนานเกินไปตอนสาธิต)
         const PERCLOS_THRESHOLD = 0.15;
         const MICROSLEEP_SEC = 0.5;
 
@@ -323,7 +325,7 @@
                 if (isDrowsy) {
                     const reason = closedDur >= MICROSLEEP_SEC
                         ? `😴 MICROSLEEP — หลับตาต่อเนื่อง ${closedDur.toFixed(1)}s`
-                        : `😴 DROWSY — PERCLOS ${Math.round(perclos * 100)}% เกินเกณฑ์ 15%`;
+                        : `😴 มีรูปแบบหลับตาถี่ช่วง ${PERCLOS_WINDOW_MS / 1000}s ที่ผ่านมา (PERCLOS ${Math.round(perclos * 100)}%)`;
                     statusElement.innerText = reason;
                     statusElement.className = "sleepy";
                     canvasCtx.strokeStyle = "#ff3333";
