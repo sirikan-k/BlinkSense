@@ -94,7 +94,7 @@
 <body>
 
     <div class="container">
-        <h1>👁️ BlinkSense </h1>
+        <h1>👁️ AI จับตาง่วงนอน (ISTEM 2026)</h1>
 
         <!-- ส่วนแสดงผลกล้อง -->
         <video id="webcam" autoplay playsinline></video>
@@ -160,6 +160,21 @@
         let closedSince = null;
         let sleepyEvents = 0;
         let wasAlerting = false;
+
+        // ---------- แก้ปัญหา "ลืมตาแล้วแต่ยังค้างขึ้นว่าหลับ" ----------
+        // สาเหตุเดิม: ตัดสินจาก CNN เฟรมเดียวตรงๆ ถ้ามีเฟรมไหนทายพลาด
+        // (noise จากแสง/มุมกล้อง) จะกระทบสถานะทันที และค้างจนกว่าจะมีเฟรม
+        // ที่ทาย "ลืมตา" ชัดเจน
+        //
+        // วิธีแก้: ใช้ debounce แบบไม่สมมาตร (asymmetric) — "เข้า" สถานะ
+        // หลับต้องเห็นสัญญาณต่อเนื่องหลายเฟรม (กันทายพลาดแวบเดียว) แต่
+        // "ออกจาก" สถานะหลับกลับมาปกติใช้แค่ไม่กี่เฟรมติดกันก็พอ เพื่อให้
+        // ระบบตอบสนองไวที่สุดทันทีที่ลืมตาจริง ไม่ค้าง
+        const REQUIRED_CLOSED_STREAK = 3; // ต้องทาย "หลับ" ติดกัน 3 เฟรมถึงจะนับ
+        const REQUIRED_OPEN_STREAK = 2;   // แค่ทาย "ลืมตา" ติดกัน 2 เฟรม ก็กลับปกติทันที
+        let closedStreak = 0;
+        let openStreak = 0;
+        let smoothedClosed = false;       // สถานะตาที่ผ่านการกรอง noise แล้ว
 
         let audioCtx = null;
         function beep(freq, dur) {
@@ -264,8 +279,24 @@
                 const sleepyScore = scores[1];
                 const frameClosed = sleepyScore > awakeScore;
 
-                // ---------- อัปเดต Microsleep (ตาปิดต่อเนื่อง) ----------
+                // ---------- กรอง noise ด้วย asymmetric debounce ----------
                 if (frameClosed) {
+                    closedStreak++;
+                    openStreak = 0;
+                } else {
+                    openStreak++;
+                    closedStreak = 0;
+                }
+                if (!smoothedClosed && closedStreak >= REQUIRED_CLOSED_STREAK) {
+                    smoothedClosed = true;      // เพิ่งยืนยันว่าหลับจริง (ไม่ใช่ noise)
+                }
+                if (smoothedClosed && openStreak >= REQUIRED_OPEN_STREAK) {
+                    smoothedClosed = false;     // ลืมตาแล้ว กลับปกติทันที
+                }
+
+                // ---------- อัปเดต Microsleep (ตาปิดต่อเนื่อง) ----------
+                // ใช้ smoothedClosed แทน frameClosed ดิบ ทุกจุดต่อจากนี้
+                if (smoothedClosed) {
                     if (closedSince === null) closedSince = now;
                 } else {
                     closedSince = null;
@@ -274,7 +305,7 @@
                 durStat.innerText = closedDur.toFixed(1) + 's';
 
                 // ---------- อัปเดต PERCLOS (สัดส่วนตาปิดใน 30 วิล่าสุด) ----------
-                closureLog.push({ t: now, closed: frameClosed });
+                closureLog.push({ t: now, closed: smoothedClosed });
                 while (closureLog.length && now - closureLog[0].t > PERCLOS_WINDOW_MS) closureLog.shift();
                 const closedFrames = closureLog.filter(x => x.closed).length;
                 const perclos = closureLog.length ? closedFrames / closureLog.length : 0;
@@ -310,6 +341,9 @@
                 statusElement.innerText = "🔍 ไม่พบใบหน้า — หันหน้าเข้ากล้อง";
                 statusElement.className = "";
                 closedSince = null;
+                closedStreak = 0;
+                openStreak = 0;
+                smoothedClosed = false;
             }
             canvasCtx.restore();
         }
