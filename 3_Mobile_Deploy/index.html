@@ -110,7 +110,7 @@
         <div class="stats">
             <div class="stat-box">
                 <div class="v" id="perclosStat">0%</div>
-                <div class="l">PERCLOS (30s)</div>
+                <div class="l">PERCLOS (12s)</div>
             </div>
             <div class="stat-box">
                 <div class="v" id="eventStat">0</div>
@@ -245,41 +245,65 @@
             if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0 && onnxSession) {
                 const landmarks = results.multiFaceLandmarks[0];
 
-                // หาจุดรอบดวงตา (ซ้าย-ขวา) เพื่อตีกรอบ Bounding Box
-                // จุดอ้างอิง MediaPipe: 33 (ขอบตาซ้ายสุด), 263 (ขอบตาขวาสุด), 159/386 (ขอบบน), 145/374 (ขอบล่าง)
-                let minX = Math.min(landmarks[33].x, landmarks[159].x, landmarks[145].x);
-                let maxX = Math.max(landmarks[263].x, landmarks[386].x, landmarks[374].x);
-                let minY = Math.min(landmarks[159].y, landmarks[386].y);
-                let maxY = Math.max(landmarks[145].y, landmarks[374].y);
+                // ---------- ครอปตาแยกทีละข้าง (สำคัญมาก) ----------
+                // แก้จากเดิมที่ครอปตาทั้งสองข้างรวมกันเป็นกล่องเดียว (มีคิ้ว/
+                // สันจมูกปนมาเยอะ) ซึ่ง "ไม่ตรงกับฟอร์แมตของ MRL Eye Dataset"
+                // ที่ใช้เทรนโมเดล (เป็นภาพตาข้างเดียวครอปชิดๆ ไม่มีคิ้ว/จมูก)
+                // ความต่างของฟอร์แมตนี้ทำให้โมเดลเจอภาพที่ "หน้าตาไม่เหมือน"
+                // ตอนเทรนเลย จึงทายพลาดบ่อยแม้ตาลืมปกติ — ครอปแยกทีละข้างตา
+                // แบบนี้จะให้ภาพที่ใกล้เคียงกับตอนเทรนมากที่สุด
+                const LEFT_EYE = [33, 160, 158, 133, 153, 144];
+                const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
 
-                // เผื่อระยะขอบ (Padding) ให้เห็นตาชัดขึ้น
-                let padX = (maxX - minX) * 0.2;
-                let padY = (maxY - minY) * 1.0;
+                function eyeBox(indices) {
+                    const xs = indices.map(i => landmarks[i].x);
+                    const ys = indices.map(i => landmarks[i].y);
+                    const minXn = Math.min(...xs), maxXn = Math.max(...xs);
+                    const minYn = Math.min(...ys), maxYn = Math.max(...ys);
+                    // padding พอประมาณรอบดวงตา (ไม่เอาคิ้ว/จมูกเข้ามาเยอะ)
+                    const padXn = (maxXn - minXn) * 0.35;
+                    const padYn = (maxYn - minYn) * 0.9;
+                    const x = Math.max(0, (minXn - padXn) * canvasElement.width);
+                    const y = Math.max(0, (minYn - padYn) * canvasElement.height);
+                    const w = Math.min(canvasElement.width - x, (maxXn - minXn + 2 * padXn) * canvasElement.width);
+                    const h = Math.min(canvasElement.height - y, (maxYn - minYn + 2 * padYn) * canvasElement.height);
+                    return { x, y, w, h };
+                }
 
-                let boxX = Math.max(0, (minX - padX) * canvasElement.width);
-                let boxY = Math.max(0, (minY - padY) * canvasElement.height);
-                let boxW = Math.min(canvasElement.width - boxX, (maxX - minX + 2 * padX) * canvasElement.width);
-                let boxH = Math.min(canvasElement.height - boxY, (maxY - minY + 2 * padY) * canvasElement.height);
+                const leftBox = eyeBox(LEFT_EYE);
+                const rightBox = eyeBox(RIGHT_EYE);
 
-                // วาดกรอบสี่เหลี่ยมรอบดวงตาบนหน้าจอ
+                // วาดกรอบทั้งสองข้างบนหน้าจอ (สีเขียว = เริ่มต้น)
                 canvasCtx.strokeStyle = "#00ff88";
                 canvasCtx.lineWidth = 2;
-                canvasCtx.strokeRect(boxX, boxY, boxW, boxH);
+                canvasCtx.strokeRect(leftBox.x, leftBox.y, leftBox.w, leftBox.h);
+                canvasCtx.strokeRect(rightBox.x, rightBox.y, rightBox.w, rightBox.h);
 
-                // ดึงภาพเฉพาะส่วนตาไปใส่ใน Canvas ลับ (ย่อเป็น 64x64)
-                eyeCropCtx.drawImage(canvasElement, boxX, boxY, boxW, boxH, 0, 0, 64, 64);
-                let imgData = eyeCropCtx.getImageData(0, 0, 64, 64);
+                // ครอปและทำนายแยกทีละข้าง แล้วรวมผล (เฉลี่ยคะแนน)
+                async function predictEye(box) {
+                    if (box.w <= 0 || box.h <= 0) return { awakeScore: 1, sleepyScore: 0 };
+                    eyeCropCtx.drawImage(canvasElement, box.x, box.y, box.w, box.h, 0, 0, 64, 64);
+                    const imgData = eyeCropCtx.getImageData(0, 0, 64, 64);
+                    const tensor = preprocessImage(imgData);
+                    const outputData = await onnxSession.run({ input: tensor });
+                    const scores = outputData.output.data;
+                    return { awakeScore: scores[0], sleepyScore: scores[1] };
+                }
 
-                // ทำนายผลด้วย ONNX Model
-                const tensor = preprocessImage(imgData);
-                const feeds = { input: tensor }; // 'input' คือชื่อ layer แรกของโมเดลเรา
-                const outputData = await onnxSession.run(feeds);
+                const [leftResult, rightResult] = await Promise.all([predictEye(leftBox), predictEye(rightBox)]);
 
-                // แปลผลลัพธ์ (คลาส 0 = awake, คลาส 1 = sleepy)
-                const scores = outputData.output.data;
-                const awakeScore = scores[0];
-                const sleepyScore = scores[1];
-                const frameClosed = sleepyScore > awakeScore;
+                // เฉลี่ยผลต่าง (sleepy - awake) ของสองข้างตา ถ้าค่าเฉลี่ย > 0
+                // ถือว่าหลับตา — ช่วยลด noise จากตาข้างเดียวที่อาจถูกบัง/มุมเอียง
+                const avgDiff = ((leftResult.sleepyScore - leftResult.awakeScore) +
+                    (rightResult.sleepyScore - rightResult.awakeScore)) / 2;
+                const frameClosed = avgDiff > 0;
+
+                // กรอบเปลี่ยนสีตามผลรวม (แดง = ตอนนี้ทายว่าหลับ)
+                if (frameClosed) {
+                    canvasCtx.strokeStyle = "#ff3333";
+                    canvasCtx.strokeRect(leftBox.x, leftBox.y, leftBox.w, leftBox.h);
+                    canvasCtx.strokeRect(rightBox.x, rightBox.y, rightBox.w, rightBox.h);
+                }
 
                 // ---------- กรอง noise ด้วย asymmetric debounce ----------
                 if (frameClosed) {
@@ -329,7 +353,8 @@
                     statusElement.innerText = reason;
                     statusElement.className = "sleepy";
                     canvasCtx.strokeStyle = "#ff3333";
-                    canvasCtx.strokeRect(boxX, boxY, boxW, boxH);
+                    canvasCtx.strokeRect(leftBox.x, leftBox.y, leftBox.w, leftBox.h);
+                    canvasCtx.strokeRect(rightBox.x, rightBox.y, rightBox.w, rightBox.h);
                     if (now - lastBeep > 1800) {
                         beep(closedDur >= MICROSLEEP_SEC ? 660 : 990, 0.25);
                         lastBeep = now;
