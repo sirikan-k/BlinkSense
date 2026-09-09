@@ -290,7 +290,21 @@
                     return { awakeScore: scores[0], sleepyScore: scores[1] };
                 }
 
-                const [leftResult, rightResult] = await Promise.all([predictEye(leftBox), predictEye(rightBox)]);
+                // รันทีละข้างตา (ไม่ใช้ Promise.all พร้อมกัน) เพราะ ONNX
+                // Runtime แบบ WASM ในเบราว์เซอร์ส่วนใหญ่ไม่รองรับการยิง
+                // session.run() ซ้อนกันสองครั้งพร้อมกันบน session เดียว
+                // ยิงพร้อมกันแล้วมักจะ error เงียบๆ ทำให้ค้างตั้งแต่เฟรมแรก
+                let leftResult, rightResult;
+                try {
+                    leftResult = await predictEye(leftBox);
+                    rightResult = await predictEye(rightBox);
+                } catch (err) {
+                    console.error("Inference error:", err);
+                    statusElement.innerText = "⚠️ เกิดข้อผิดพลาดตอนประมวลผล: " + (err.message || err);
+                    statusElement.className = "";
+                    canvasCtx.restore();
+                    return;
+                }
 
                 // เฉลี่ยผลต่าง (sleepy - awake) ของสองข้างตา ถ้าค่าเฉลี่ย > 0
                 // ถือว่าหลับตา — ช่วยลด noise จากตาข้างเดียวที่อาจถูกบัง/มุมเอียง
